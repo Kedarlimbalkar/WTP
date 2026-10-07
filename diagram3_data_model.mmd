@@ -1,0 +1,66 @@
+erDiagram
+    GLOBAL_APP_STATE ||--|| MODEL_REGISTRY : holds
+    GLOBAL_APP_STATE ||--|| JOBS_REGISTRY : manages
+    JOBS_REGISTRY ||--o{ JOB_ENTRY : contains
+    JOB_ENTRY ||--|| JOB_PARAMS : configures
+    JOB_ENTRY ||--o{ IMAGE_ROW : processes
+    IMAGE_ROW ||--o{ DETECTION : detects
+    JOB_ENTRY ||--|| DISK_WORKSPACE : outputs_to
+
+    GLOBAL_APP_STATE {
+        YOLO_model_instance model "Loaded via lifespan context manager"
+        threading_Lock model_lock "Mutex guarding model.predict calls"
+    }
+
+    MODEL_REGISTRY {
+        string model_path "Default: model/best.pt"
+        dict names "Class ID to label mapping (0: wind turbine, 1: pylon, etc)"
+        string ignore_label "Default: 'pylon' (case-insensitive)"
+    }
+
+    JOBS_REGISTRY {
+        dict jobs "Key: job_id (uuid hex string)"
+        threading_Lock jobs_lock "Mutex guarding jobs dictionary mutations"
+        int ttl_seconds "Default: 3600 seconds (1 hour)"
+    }
+
+    JOB_ENTRY {
+        string job_id PK "12-char hex string (uuid4)"
+        string status "running | done | error"
+        string message "Error or status message"
+        float created "Epoch timestamp (time.time())"
+        string workdir "Path to temp workspace (/tmp/job_uuid)"
+        string zip_path "Path to uploaded input.zip"
+        list names "Filenames of extracted images"
+        int done "Counter of processed images"
+    }
+
+    JOB_PARAMS {
+        float conf "Minimum confidence threshold (0.05 - 0.95)"
+        float iou "Overlap NMS threshold (0.10 - 0.95)"
+        int imgsz "Inference resolution (640, 960, 1280)"
+    }
+
+    IMAGE_ROW {
+        int index "0-based position in zip"
+        string name "Original image filename in zip"
+        int count "Number of detected turbines"
+        float max_confidence "Highest confidence score in image"
+        float inference_ms "Model execution time in milliseconds"
+        string error "None | Error message string"
+    }
+
+    DETECTION {
+        string label "Class label (Wind Turbine)"
+        float confidence "Probability score (0.0000 - 1.0000)"
+        array box "[x1, y1, x2, y2] bounding box coordinates in pixels"
+    }
+
+    DISK_WORKSPACE {
+        file input_zip "Raw uploaded zip (deleted upon completion)"
+        file results_zip "Final downloadable zip containing annotated/ & CSVs"
+        folder annotated "Folder in results.zip containing labeled images"
+        file thumbnail_jpg "800x800 preview JPEG per image ({idx}.jpg)"
+        file results_csv "Summary spreadsheet (file, turbines, confidence, ms, status)"
+        file detections_csv "Per-box bounding box spreadsheet (file, label, conf, x1, y1, x2, y2)"
+    }

@@ -1,0 +1,126 @@
+flowchart TD
+flowchart LR
+    classDef client fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    classDef serverCore fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#ecfdf5
+    classDef modelLayer fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#e0e7ff
+    classDef storageLayer fill:#701a75,stroke:#f0abfc,stroke-width:2px,color:#fdf4ff
+    classDef azureLayer fill:#451a03,stroke:#fb923c,stroke-width:2px,color:#fff7ed
+
+    subgraph CLIENT_SIDE[" CLIENT SIDE (Browser SPA - HTML5 / JS / Canvas) "]
+        direction TB
+        UI_LOAD["1. User opens App (GET /)<br/>Receives Single-File HTML/CSS/JS"]:::client
+        UI_EVENT["2. Drag & Drop or File Select<br/>(Image or ZIP archive)"]:::client
+        UI_PREVIEW["3. Client Canvas Render<br/>Displays local image preview & options"]:::client
+        
+        subgraph CLIENT_MODES[" Client Execution Modes "]
+            MODE_SINGLE["Single Image Path:<br/>Construct FormData & POST /predict"]:::client
+            MODE_ZIP["ZIP Bulk Path:<br/>Validate .zip extension & POST /predict_zip"]:::client
+        end
+
+        UI_POLL["4. Client Polling Loop (ZIP mode)<br/>Polls GET /jobs/{job_id} every 1s"]:::client
+        UI_RENDER_SINGLE["5A. Client Overlay Canvas Drawing<br/>Draws bounding boxes & labels live"]:::client
+        UI_RENDER_ZIP["5B. Client Gallery & Progress Bar<br/>Renders thumbnails & Download ZIP link"]:::client
+    end
+
+    subgraph SERVER_SIDE[" SERVER SIDE (Azure Container Apps / FastAPI Engine) "]
+        direction TB
+        direction LR
+
+        subgraph CONTAINER_STARTUP[" Startup & Lifespan Initialization "]
+        subgraph CONTAINER_STARTUP[" Startup & Initialization "]
+            direction TB
+            D_SCRIPT["src/download_model.py"]:::serverCore
+            CHECK_LOCAL{"Check model/best.pt<br/>on disk?"}:::serverCore
+            AZ_FETCH["Fetch blob via Azure Blob SDK<br/>(models/turbine_v10/best.pt)"]:::azureLayer
+            FASTAPI_LIFESPAN["FastAPI Lifespan Manager<br/>Loads YOLO(MODEL_PATH) into memory state"]:::serverCore
+        end
+
+        subgraph FASTAPI_ROUTER[" FastAPI Web Server (Uvicorn ASGI) "]
+            direction TB
+            ROUTE_INFO["GET /info<br/>Returns Model Metadata & Zip Limits"]:::serverCore
+            ROUTE_PREDICT["POST /predict<br/>Single Image Inference Handler"]:::serverCore
+            ROUTE_PREDICT_ZIP["POST /predict_zip<br/>Bulk Zip Job Initiator"]:::serverCore
+            ROUTE_JOB_STATUS["GET /jobs/{id}<br/>Job Status & Rows Endpoint"]:::serverCore
+            ROUTE_JOB_IMG["GET /jobs/{id}/image/{idx}<br/>Thumbnail Server"]:::serverCore
+            ROUTE_JOB_DL["GET /jobs/{id}/download<br/>Serves final results.zip"]:::serverCore
+        end
+
+        subgraph CONCURRENCY_MODEL[" Model Mutex Guard & Thread Pool "]
+            direction TB
+            MUTEX[["model_lock (threading.Lock)<br/>Enforces Single-Threaded Model Inference"]]:::modelLayer
+            YOLO_PREDICT["YOLO.predict(image, conf, iou, imgsz)<br/>Runs Object Detection"]:::modelLayer
+            FILTER_PYLON["Post-Processing Filter<br/>Ignores detections with 'pylon' label"]:::modelLayer
+        end
+
+        subgraph ASYNC_ZIP_ENGINE[" Background Daemon Worker Thread "]
+            direction TB
+            BG_THREAD["Background Thread (run_job)<br/>Executes asynchronously"]:::serverCore
+            ZIP_UNPACK["Extract & Validate Images from input.zip"]:::serverCore
+            ANNOTATE_ENGINE["Pillow ImageDraw Engine<br/>Draws bounding boxes & builds thumbnail"]:::serverCore
+            CSV_GENERATOR["CSV Writer<br/>Generates results.csv & detections.csv"]:::storageLayer
+            ZIP_PACKER["ZipFile Writer<br/>Compiles annotated images + CSVs to results.zip"]:::storageLayer
+        end
+
+        subgraph MEMORY_AND_DISK[" State Management & Ephemeral Disk "]
+            direction TB
+            JOB_DICT["In-Memory jobs Dictionary<br/>Thread-safe under jobs_lock"]:::storageLayer
+            JOB_CLEANUP["cleanup_jobs Routine<br/>Evicts jobs older than 3600s"]:::storageLayer
+            TEMP_DISK["Container Temp Directory (/tmp/job_uuid)<br/>Stores input.zip, thumbnails, results.zip"]:::storageLayer
+        end
+    end
+
+    subgraph AZURE_CLOUD[" AZURE CLOUD PLATFORM "]
+        direction TB
+        AZ_FETCH["Fetch blob via Azure Blob SDK<br/>(models/turbine_v10/best.pt)"]:::azureLayer
+        BLOB_STORE[("Azure Blob Storage<br/>Container: wind-turbine-data")]:::azureLayer
+    end
+
+    %% ---------- FLOW CONNECTORS ---------- %%
+    %% ---------- FLOW CONNECTORS (HORIZONTAL LR LAYOUT) ---------- %%
+
+    %% Startup Flow
+    D_SCRIPT --> CHECK_LOCAL
+    CHECK_LOCAL -- "No" --> AZ_FETCH
+    AZ_FETCH --> BLOB_STORE
+    CHECK_LOCAL -- "Yes" --> FASTAPI_LIFESPAN
+    AZ_FETCH -- "Write model/best.pt" --> FASTAPI_LIFESPAN
+
+    %% Client to Server Route Mapping
+    UI_LOAD --> ROUTE_INFO
+    UI_EVENT --> UI_PREVIEW
+    UI_PREVIEW --> MODE_SINGLE
+    UI_PREVIEW --> MODE_ZIP
+
+    MODE_SINGLE -- "Multipart Request" --> ROUTE_PREDICT
+    MODE_ZIP -- "ZIP Payload Upload" --> ROUTE_PREDICT_ZIP
+
+    %% Single Image Server Flow
+    ROUTE_PREDICT --> MUTEX
+    MUTEX --> YOLO_PREDICT
+    YOLO_PREDICT --> FILTER_PYLON
+    FILTER_PYLON -- "Return JSON (Count, ms, boxes)" --> UI_RENDER_SINGLE
+
+    %% ZIP Server Flow
+    ROUTE_PREDICT_ZIP --> JOB_CLEANUP
+    ROUTE_PREDICT_ZIP --> TEMP_DISK
+    ROUTE_PREDICT_ZIP --> BG_THREAD
+    ROUTE_PREDICT_ZIP -- "Immediate Response (job_id, total)" --> UI_POLL
+
+    BG_THREAD --> ZIP_UNPACK
+    ZIP_UNPACK --> MUTEX
+    ANNOTATE_ENGINE --> TEMP_DISK
+    FILTER_PYLON --> ANNOTATE_ENGINE
+    BG_THREAD --> CSV_GENERATOR
+    CSV_GENERATOR --> ZIP_PACKER
+    ZIP_PACKER --> TEMP_DISK
+    BG_THREAD --> JOB_DICT
+
+    %% Polling and Download Flow
+    UI_POLL -- "GET status" --> ROUTE_JOB_STATUS
+    ROUTE_JOB_STATUS --> JOB_DICT
+    UI_POLL -- "GET Thumbnail" --> ROUTE_JOB_IMG
+    ROUTE_JOB_IMG --> TEMP_DISK
+    UI_POLL -- "Finished" --> UI_RENDER_ZIP
+    UI_RENDER_ZIP -- "GET /jobs/{id}/download" --> ROUTE_JOB_DL
+    ROUTE_JOB_DL --> TEMP_DISK
+
